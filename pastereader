@@ -1,0 +1,237 @@
+import sys
+import io
+import requests
+from PIL import Image, ImageGrab
+from rapidocr_onnxruntime import RapidOCR
+
+from PyQt6.QtCore import Qt, QThread, pyqtSignal, QPoint, QEvent
+from PyQt6.QtGui import QCursor, QFont
+from PyQt6.QtWidgets import (
+    QApplication, QWidget, QVBoxLayout, QHBoxLayout, QLabel,
+    QTextEdit, QPushButton, QGraphicsDropShadowEffect, QFrame
+)
+
+# 初始化离线 OCR 引擎
+engine = RapidOCR()
+
+def translate_text(text, target_lang="zh"):
+    if not text.strip():
+        return ""
+    try:
+        url = f"https://translate.googleapis.com/translate_a/single?client=gtx&sl=auto&tl={target_lang}&dt=t&q={text}"
+        response = requests.get(url, timeout=5)
+        result = response.json()
+        return "".join([item[0] for item in result[0] if item[0]])
+    except Exception as e:
+        return f"翻译失败: {str(e)}"
+
+
+class ClipboardListener(QThread):
+    """后台剪贴板监听线程"""
+    image_detected = pyqtSignal(object)
+
+    def __init__(self):
+        super().__init__()
+        self.running = True
+        self.last_hash = None
+
+    def run(self):
+        while self.running:
+            try:
+                img = ImageGrab.grabclipboard()
+                if isinstance(img, Image.Image):
+                    # 通过像素数据计算简易 hash 避免重复触发
+                    img_hash = hash(img.tobytes())
+                    if img_hash != self.last_hash:
+                        self.last_hash = img_hash
+                        self.image_detected.emit(img)
+            except Exception:
+                pass
+            self.msleep(500)
+
+    def stop(self):
+        self.running = False
+
+
+class FloatingWindow(QWidget):
+    """PyQt6 无边框跟随鼠标悬浮窗"""
+    def __init__(self):
+        super().__init__()
+        self.init_ui()
+
+    def init_ui(self):
+        # 1. 窗口属性设置：无边框 + 保持置顶 + 不在任务栏显示图标
+        self.setWindowFlags(
+            Qt.WindowType.FramelessWindowHint |
+            Qt.WindowType.WindowStaysOnTopHint |
+            Qt.WindowType.Tool
+        )
+        self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground) # 背景透明（配合圆角阴影）
+        self.setFixedSize(380, 280)
+
+        # 全局安装事件过滤器：点击窗口外部区域自动隐藏
+        qApp.installEventFilter(self)
+
+        # 2. 外层主容器与阴影样式
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(10, 10, 10, 10)
+
+        self.container = QFrame()
+        self.container.setStyleSheet("""
+            QFrame {
+                background-color: #1e1e2e;
+                border: 1px solid #313244;
+                border-radius: 12px;
+            }
+            QLabel {
+                color: #cdd6f4;
+                font-size: 12px;
+                font-weight: bold;
+                border: none;
+            }
+            QTextEdit {
+                background-color: #181825;
+                color: #a6adc8;
+                border: 1px solid #45475a;
+                border-radius: 6px;
+                padding: 4px;
+                font-size: 12px;
+            }
+            QPushButton {
+                background-color: #89b4fa;
+                color: #11111b;
+                border: none;
+                border-radius: 6px;
+                padding: 5px 12px;
+                font-weight: bold;
+                font-size: 11px;
+            }
+            QPushButton:hover {
+                background-color: #b4befe;
+            }
+            QPushButton:pressed {
+                background-color: #74c7ec;
+            }
+        """)
+
+        # 增加阴影效果
+        shadow = QGraphicsDropShadowEffect(self)
+        shadow.setBlurRadius(15)
+        shadow.setOffset(0, 4)
+        shadow.setColor(Qt.GlobalColor.black)
+        self.container.setGraphicsEffect(shadow)
+
+        # 3. 内部布局构成
+        c_layout = QVBoxLayout(self.container)
+        c_layout.setSpacing(6)
+
+        # 标题栏/头部
+        header_layout = QHBoxLayout()
+        header_title = QLabel("✨ Snipaste OCR & 翻译")
+        header_layout.addWidget(header_title)
+        header_layout.addStretch()
+        
+        # 关闭按钮
+        close_btn = QPushButton("✕")
+        close_btn.setFixedSize(20, 20)
+        close_btn.setStyleSheet("QPushButton { background: transparent; color: #a6adc8; border-radius: 10px; font-size: 10px; } QPushButton:hover { background: #f38ba8; color: #11111b; }")
+        close_btn.clicked.connect(self.hide)
+        header_layout.addWidget(close_btn)
+        
+        c_layout.addLayout(header_layout)
+
+        # 识别原文
+        c_layout.addWidget(QLabel("原文识别:"))
+        self.ocr_box = QTextEdit()
+        c_layout.addWidget(self.ocr_box)
+
+        # 翻译结果
+        c_layout.addWidget(QLabel("翻译结果:"))
+        self.trans_box = QTextEdit()
+        c_layout.addWidget(self.trans_box)
+
+        # 底部操作按钮
+        btn_layout = QHBoxLayout()
+        btn_copy_ocr = QPushButton("复制原文")
+        btn_copy_trans = QPushButton("复制翻译")
+        
+        btn_copy_ocr.clicked.connect(self.copy_ocr)
+        btn_copy_trans.clicked.connect(self.copy_trans)
+
+        btn_layout.addWidget(btn_copy_ocr)
+        btn_layout.addWidget(btn_copy_trans)
+        btn_layout.addStretch()
+
+        c_layout.addLayout(btn_layout)
+        layout.addWidget(self.container)
+
+    def eventFilter(self, obj, event):
+        """点击窗口外部区域自动隐藏悬浮窗"""
+        if event.type() == QEvent.Type.MouseButtonPress:
+            if self.isVisible():
+                # 判断点击位置是否在当前悬浮窗几何区域外
+                if not self.geometry().contains(QCursor.pos()):
+                    self.hide()
+        return super().eventFilter(obj, event)
+
+    def update_and_show(self, ocr_text, trans_text):
+        """更新文本，定位到鼠标旁边并显示"""
+        self.ocr_box.setText(ocr_text)
+        self.trans_box.setText(trans_text)
+
+        # 获取当前鼠标在屏幕上的全局坐标
+        cursor_pos = QCursor.pos()
+
+        # 获取当前屏幕分辨率，防止弹窗超出屏幕边界
+        screen = QApplication.primaryScreen().geometry()
+        x = cursor_pos.x() + 15  # 默认在鼠标右下方偏移 15px
+        y = cursor_pos.y() + 15
+
+        if x + self.width() > screen.width():
+            x = cursor_pos.x() - self.width() - 5
+        if y + self.height() > screen.height():
+            y = cursor_pos.y() - self.height() - 5
+
+        self.move(x, y)
+        self.show()
+        self.activateWindow()
+
+    def copy_ocr(self):
+        QApplication.clipboard().setText(self.ocr_box.toPlainText())
+
+    def copy_trans(self):
+        QApplication.clipboard().setText(self.trans_box.toPlainText())
+
+
+class MainApp(QApplication):
+    def __init__(self, sys_argv):
+        super().__init__(sys_argv)
+        self.window = FloatingWindow()
+
+        # 开启剪贴板后台监听线程
+        self.listener = ClipboardListener()
+        self.listener.image_detected.connect(self.handle_image)
+        self.listener.start()
+
+    def handle_image(self, img):
+        # 1. 转换 PIL Image 为 bytes 并运行 RapidOCR
+        img_byte_arr = io.BytesIO()
+        img.save(img_byte_arr, format='PNG')
+        
+        result, _ = engine(img_byte_arr.getvalue())
+        if result:
+            ocr_text = "\n".join([line[1] for line in result])
+            trans_text = translate_text(ocr_text)
+            
+            # 2. 在 UI 主线程更新并弹出悬浮窗
+            self.window.update_and_show(ocr_text, trans_text)
+
+    def cleanup(self):
+        self.listener.stop()
+        self.listener.wait()
+
+
+if __name__ == "__main__":
+    app = MainApp(sys.argv)
+    app.aboutToQuit.connect(app.cleanup)
+    sys.exit(app.exec())
