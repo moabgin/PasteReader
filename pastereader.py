@@ -48,7 +48,7 @@ def translate_text(text, target_lang="zh"):
 
 def format_ocr_layout(ocr_result):
     """
-    根据 OCR 结果的坐标信息排版，尽量还原原截图的文字布局。
+    根据 OCR 结果的坐标信息排版，尽量还原原截图的文字布局
 
     RapidOCR 每项格式: [box, text, score]
     box: [[x1,y1], [x2,y2], [x3,y3], [x4,y4]]  四个角点
