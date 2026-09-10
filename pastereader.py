@@ -386,19 +386,27 @@ class FloatingWindow(QWidget):
         self._hide_timer = QTimer(self)
         self._hide_timer.setSingleShot(True)
         self._hide_timer.timeout.connect(self.hide)
-        self.lang_combo.aboutToHide.connect(self._on_lang_popup_hide)
+        self._lang_popup_open = False
+        self.lang_combo.showPopup.connect(self._on_lang_popup_show)
+        self.lang_combo.hidePopup.connect(self._on_lang_popup_hide)
 
     def changeEvent(self, event):
         """窗口失去焦点时延迟自动隐藏；语言下拉框打开期间不隐藏"""
         if event.type() == QEvent.Type.ActivationChange:
             if self.isActiveWindow():
                 self._hide_timer.stop()
-            elif not self.lang_combo.view().isVisible():
+            elif not self._lang_popup_open:
                 self._hide_timer.start(200)
         super().changeEvent(event)
 
+    def _on_lang_popup_show(self):
+        """下拉框打开：暂停失焦隐藏"""
+        self._lang_popup_open = True
+        self._hide_timer.stop()
+
     def _on_lang_popup_hide(self):
         """下拉框关闭后若窗口仍未获得焦点，则走延迟隐藏流程"""
+        self._lang_popup_open = False
         if not self.isActiveWindow():
             self._hide_timer.start(200)
 
