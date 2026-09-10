@@ -1,15 +1,19 @@
 import sys
+import ctypes
+
 import numpy as np
 import requests
-import keyboard
 from PIL import Image, ImageGrab
 from rapidocr_onnxruntime import RapidOCR
 
-from PyQt6.QtCore import Qt, QThread, pyqtSignal, QEvent, QTimer
-from PyQt6.QtGui import QCursor
+from PyQt6.QtCore import Qt, QThread, pyqtSignal, QEvent, QTimer, QSettings
+from PyQt6.QtGui import (
+    QCursor, QTextCursor, QIcon, QPixmap, QPainter, QColor, QFont,
+)
 from PyQt6.QtWidgets import (
     QApplication, QWidget, QVBoxLayout, QHBoxLayout, QLabel,
-    QTextEdit, QPushButton, QGraphicsDropShadowEffect, QFrame, QComboBox
+    QTextEdit, QPushButton, QGraphicsDropShadowEffect, QFrame, QComboBox,
+    QCheckBox, QSystemTrayIcon, QMenu,
 )
 
 # 初始化离线 OCR 引擎
@@ -34,16 +38,62 @@ LANGUAGES = {
     "Tiếng Việt": "vi",
 }
 
-def translate_text(text, target_lang="zh"):
-    if not text.strip():
-        return ""
-    try:
-        url = f"https://translate.googleapis.com/translate_a/single?client=gtx&sl=auto&tl={target_lang}&dt=t&q={text}"
-        response = requests.get(url, timeout=5)
-        result = response.json()
-        return "".join([item[0] for item in result[0] if item[0]])
-    except Exception as e:
-        return f"翻译失败: {str(e)}"
+# 全局热键参数：Ctrl + Shift + Q
+HOTKEY_ID = 1
+HOTKEY_MODS = 0x0002 | 0x0004  # MOD_CONTROL | MOD_SHIFT
+HOTKEY_VK = 0x51              # 虚拟键码 'Q'
+WM_HOTKEY = 0x0312
+
+
+def _settings():
+    return QSettings("PasteReader", "PasteReader")
+
+
+class TranslateWorker(QThread):
+    """后台执行网络翻译，避免阻塞 UI 线程"""
+    done = pyqtSignal(bool, str)
+
+    def __init__(self, text, target_lang, parent=None):
+        super().__init__(parent)
+        self._text = text
+        self._target_lang = target_lang
+
+    def run(self):
+        try:
+            response = requests.get(
+                "https://translate.googleapis.com/translate_a/single",
+                params={
+                    "client": "gtx",
+                    "sl": "auto",
+                    "tl": self._target_lang,
+                    "dt": "t",
+                    "q": self._text,
+                },
+                timeout=10,
+            )
+            response.raise_for_status()
+            data = response.json()
+            translated = "".join(item[0] for item in data[0] if item[0])
+            self.done.emit(True, translated)
+        except Exception as e:
+            self.done.emit(False, str(e))
+
+
+class OcrWorker(QThread):
+    """后台执行 OCR 识别，避免阻塞 UI 线程"""
+    done = pyqtSignal(bool, str)
+
+    def __init__(self, image, parent=None):
+        super().__init__(parent)
+        self._image = image
+
+    def run(self):
+        try:
+            result, _ = engine(np.array(self._image.convert("RGB")))
+            text = format_ocr_layout(result) if result else ""
+            self.done.emit(True, text)
+        except Exception as e:
+            self.done.emit(False, str(e))
 
 
 def format_ocr_layout(ocr_result):
@@ -144,31 +194,27 @@ def format_ocr_layout(ocr_result):
     return "\n".join(output_lines)
 
 
-class ClipboardListener(QThread):
-    """后台剪贴板监听线程"""
-    image_detected = pyqtSignal(object)
+class HotkeyBridge(QWidget):
+    """隐藏窗口：接收 RegisterHotKey 发来的 WM_HOTKEY 消息（无需管理员权限）"""
+    hotkey_pressed = pyqtSignal()
 
     def __init__(self):
         super().__init__()
-        self.running = True
-        self.last_hash = None
+        self.winId()  # 强制创建原生窗口以接收系统消息
 
-    def run(self):
-        while self.running:
+    def nativeEvent(self, eventType, message):
+        if eventType == "windows_generic_MSG":
             try:
-                img = ImageGrab.grabclipboard()
-                if isinstance(img, Image.Image):
-                    # 通过像素数据计算简易 hash 避免重复触发
-                    img_hash = hash(img.tobytes())
-                    if img_hash != self.last_hash:
-                        self.last_hash = img_hash
-                        self.image_detected.emit(img)
+                # Windows MSG 结构体：hwnd(指针大小) + message(4 字节)
+                offset = ctypes.sizeof(ctypes.c_void_p)
+                msg_type = int.from_bytes(
+                    ctypes.string_at(message, offset), 2, "little")
+                if msg_type == WM_HOTKEY:
+                    self.hotkey_pressed.emit()
+                    return True, 0
             except Exception:
                 pass
-            self.msleep(500)
-
-    def stop(self):
-        self.running = False
+        return super().nativeEvent(eventType, message)
 
 
 class FloatingWindow(QWidget):
@@ -184,12 +230,13 @@ class FloatingWindow(QWidget):
             Qt.WindowType.WindowStaysOnTopHint |
             Qt.WindowType.Tool
         )
-        self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground) # 背景透明（配合圆角阴影）
-        self.setFixedSize(380, 280)
+        self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground)  # 背景透明（配合圆角阴影）
+        self.setFixedSize(400, 300)
 
         # 2. 外层主容器与阴影样式
+        # 边距需大于阴影 blur 半径，否则阴影会被窗口边界裁切
         layout = QVBoxLayout(self)
-        layout.setContentsMargins(10, 10, 10, 10)
+        layout.setContentsMargins(16, 16, 16, 16)
 
         self.container = QFrame()
         self.container.setStyleSheet("""
@@ -231,7 +278,7 @@ class FloatingWindow(QWidget):
 
         # 增加阴影效果
         shadow = QGraphicsDropShadowEffect(self)
-        shadow.setBlurRadius(15)
+        shadow.setBlurRadius(25)
         shadow.setOffset(0, 4)
         shadow.setColor(Qt.GlobalColor.black)
         self.container.setGraphicsEffect(shadow)
@@ -245,28 +292,43 @@ class FloatingWindow(QWidget):
         header_title = QLabel("Snipaste OCR & 翻译")
         header_layout.addWidget(header_title)
         header_layout.addStretch()
-        
-        # 关闭按钮
+
+        # 关闭按钮（隐藏窗口，程序继续后台运行；退出请用托盘菜单）
         close_btn = QPushButton("✕")
         close_btn.setFixedSize(20, 20)
+        close_btn.setToolTip("隐藏窗口（程序继续后台运行，可从托盘图标退出）")
         close_btn.setStyleSheet("QPushButton { background: transparent; color: #a6adc8; border-radius: 10px; font-size: 10px; } QPushButton:hover { background: #f38ba8; color: #11111b; }")
         close_btn.clicked.connect(self.hide)
         header_layout.addWidget(close_btn)
-        
+
         c_layout.addLayout(header_layout)
 
-        # 识别原文
+        # 识别原文（只读，防止误编辑）
         c_layout.addWidget(QLabel("原文识别:"))
         self.ocr_box = QTextEdit()
+        self.ocr_box.setReadOnly(True)
         c_layout.addWidget(self.ocr_box)
 
         # 翻译结果
         trans_header_layout = QHBoxLayout()
         trans_header_layout.addWidget(QLabel("翻译结果:"))
 
+        # 自动翻译开关（状态持久化）
+        self.auto_translate = QCheckBox("自动翻译")
+        self.auto_translate.setChecked(bool(_settings().value("auto_translate", False)))
+        self.auto_translate.setToolTip("OCR 完成后自动翻译")
+        self.auto_translate.toggled.connect(
+            lambda on: _settings().setValue("auto_translate", on)
+        )
+        trans_header_layout.addWidget(self.auto_translate)
+
         self.lang_combo = QComboBox()
         self.lang_combo.addItems(LANGUAGES.keys())
-        self.lang_combo.setCurrentText("中文 (简体)")
+        saved_lang = _settings().value("language")
+        if saved_lang in LANGUAGES:
+            self.lang_combo.setCurrentText(saved_lang)
+        else:
+            self.lang_combo.setCurrentText("中文 (简体)")
         self.lang_combo.setFixedWidth(100)
         self.lang_combo.setStyleSheet("""
             QComboBox {
@@ -289,6 +351,9 @@ class FloatingWindow(QWidget):
                 font-size: 10px;
             }
         """)
+        self.lang_combo.currentTextChanged.connect(
+            lambda text: _settings().setValue("language", text)
+        )
         trans_header_layout.addWidget(self.lang_combo)
         trans_header_layout.addStretch()
 
@@ -299,13 +364,14 @@ class FloatingWindow(QWidget):
 
         c_layout.addLayout(trans_header_layout)
         self.trans_box = QTextEdit()
+        self.trans_box.setReadOnly(True)
         c_layout.addWidget(self.trans_box)
 
         # 底部操作按钮
         btn_layout = QHBoxLayout()
         btn_copy_ocr = QPushButton("复制原文")
         btn_copy_trans = QPushButton("复制翻译")
-        
+
         btn_copy_ocr.clicked.connect(self.copy_ocr)
         btn_copy_trans.clicked.connect(self.copy_trans)
 
@@ -316,35 +382,54 @@ class FloatingWindow(QWidget):
         c_layout.addLayout(btn_layout)
         layout.addWidget(self.container)
 
+        # 失焦隐藏守卫：延迟 200ms 再隐藏，避免下拉框打开时抢焦点导致误隐藏
+        self._hide_timer = QTimer(self)
+        self._hide_timer.setSingleShot(True)
+        self._hide_timer.timeout.connect(self.hide)
+        self.lang_combo.aboutToHide.connect(self._on_lang_popup_hide)
+
     def changeEvent(self, event):
-        """窗口失去焦点时自动隐藏"""
+        """窗口失去焦点时延迟自动隐藏；语言下拉框打开期间不隐藏"""
         if event.type() == QEvent.Type.ActivationChange:
-            if not self.isActiveWindow():
-                self.hide()
+            if self.isActiveWindow():
+                self._hide_timer.stop()
+            elif not self.lang_combo.view().isVisible():
+                self._hide_timer.start(200)
         super().changeEvent(event)
+
+    def _on_lang_popup_hide(self):
+        """下拉框关闭后若窗口仍未获得焦点，则走延迟隐藏流程"""
+        if not self.isActiveWindow():
+            self._hide_timer.start(200)
 
     def update_and_show(self, ocr_text, trans_text=""):
         """更新文本，定位到鼠标旁边并显示"""
-        self.ocr_box.setText(ocr_text)
-        self.trans_box.setText(trans_text)
+        self.ocr_box.setPlainText(ocr_text)
+        self.ocr_box.moveCursor(QTextCursor.MoveOperation.Start)
+        self.trans_box.setPlainText(trans_text)
         self.trans_btn.setEnabled(True)  # 新 OCR 结果，重新启用翻译按钮
 
-        # 获取当前鼠标在屏幕上的全局坐标
+        # 获取鼠标所在屏幕（支持多显示器），防止弹窗超出屏幕边界
         cursor_pos = QCursor.pos()
-
-        # 获取当前屏幕分辨率，防止弹窗超出屏幕边界
-        screen = QApplication.primaryScreen().geometry()
+        screen = QApplication.screenAt(cursor_pos) or QApplication.primaryScreen()
+        geom = screen.geometry()
         x = cursor_pos.x() + 15  # 默认在鼠标右下方偏移 15px
         y = cursor_pos.y() + 15
 
-        if x + self.width() > screen.width():
+        if x + self.width() > geom.right():
             x = cursor_pos.x() - self.width() - 5
-        if y + self.height() > screen.height():
+        if y + self.height() > geom.bottom():
             y = cursor_pos.y() - self.height() - 5
+        x = max(geom.left(), x)
+        y = max(geom.top(), y)
 
         self.move(x, y)
         self.show()
         self.activateWindow()
+
+        # 勾选了自动翻译则立即翻译
+        if self.auto_translate.isChecked():
+            self.do_translate()
 
     def copy_ocr(self):
         QApplication.clipboard().setText(self.ocr_box.toPlainText())
@@ -353,14 +438,27 @@ class FloatingWindow(QWidget):
         QApplication.clipboard().setText(self.trans_box.toPlainText())
 
     def do_translate(self):
-        """手动触发翻译"""
+        """触发翻译（后台线程执行，不卡 UI，防重入）"""
         ocr_text = self.ocr_box.toPlainText()
-        if not ocr_text.strip():
+        if not ocr_text.strip() or not self.trans_btn.isEnabled():
             return
-        target_lang = LANGUAGES[self.lang_combo.currentText()]
-        trans_text = translate_text(ocr_text, target_lang)
-        self.trans_box.setText(trans_text)
+        target_lang = LANGUAGES.get(self.lang_combo.currentText(), "zh-CN")
         self.trans_btn.setEnabled(False)
+        self.trans_box.clear()
+
+        worker = TranslateWorker(ocr_text, target_lang, self)
+        worker.done.connect(self._on_translate_done)
+        worker.done.connect(worker.deleteLater)
+        worker.start()
+
+    def _on_translate_done(self, ok, text):
+        self.trans_btn.setEnabled(True)
+        if ok:
+            self.trans_box.setPlainText(text)
+            self.trans_box.moveCursor(QTextCursor.MoveOperation.Start)
+        else:
+            self.trans_box.clear()
+            self.show_toast(f"翻译失败: {text}", 2500)
 
     def show_toast(self, message, duration=1500):
         """在屏幕中央底部显示短暂提示（非阻塞）"""
@@ -392,43 +490,108 @@ class FloatingWindow(QWidget):
 
 
 class MainApp(QApplication):
-    toggle_signal = pyqtSignal()
-
     def __init__(self, sys_argv):
         super().__init__(sys_argv)
         self.ocr_enabled = True
         self.window = FloatingWindow()
 
-        # 连接切换信号（由键盘钩子线程触发，主线程执行）
-        self.toggle_signal.connect(self._toggle_ocr)
+        # 注册全局快捷键 Ctrl+Shift+Q（Windows RegisterHotKey，无需管理员权限）
+        self._hotkey_ok = False
+        if sys.platform == "win32":
+            self.bridge = HotkeyBridge()
+            hwnd = int(self.bridge.winId())
+            self._hotkey_ok = bool(ctypes.windll.user32.RegisterHotKey(
+                hwnd, HOTKEY_ID, HOTKEY_MODS, HOTKEY_VK))
+            if self._hotkey_ok:
+                self.bridge.hotkey_pressed.connect(self._toggle_ocr)
+            else:
+                self.window.show_toast("全局热键注册失败，可用托盘菜单切换 OCR", 3000)
 
-        # 注册全局快捷键 Ctrl+Shift+Q 切换 OCR 功能
-        keyboard.add_hotkey('ctrl+shift+q', self.toggle_signal.emit)
+        self._setup_tray()
 
-        # 开启剪贴板后台监听线程
-        self.listener = ClipboardListener()
-        self.listener.image_detected.connect(self.handle_image)
-        self.listener.start()
+        # 事件驱动的剪贴板监听（替代 500ms 轮询 + 全像素 hash）
+        self._last_clip_hash = None
+        self._ocr_busy = False
+        self.clipboard().dataChanged.connect(self._on_clipboard_changed)
+
+    def _setup_tray(self):
+        """系统托盘图标：切换 OCR / 显示窗口 / 退出程序"""
+        self.tray = QSystemTrayIcon(self.make_tray_icon(), self)
+        self.tray.setToolTip("PasteReader - 截图 OCR & 翻译")
+        menu = QMenu()
+        self._tray_toggle_action = menu.addAction(
+            "关闭 OCR 识别" if self.ocr_enabled else "开启 OCR 识别")
+        self._tray_toggle_action.triggered.connect(self._toggle_ocr)
+        menu.addSeparator()
+        menu.addAction("显示窗口", self._show_window)
+        menu.addAction("退出 PasteReader", self.quit)
+        self.tray.setContextMenu(menu)
+        self.tray.show()
+
+    @staticmethod
+    def make_tray_icon():
+        """程序化生成托盘图标（蓝色圆角方块 + P），避免依赖外部图片资源"""
+        pm = QPixmap(64, 64)
+        pm.fill(Qt.GlobalColor.transparent)
+        p = QPainter(pm)
+        p.setRenderHint(QPainter.RenderHint.Antialiasing)
+        p.setPen(Qt.PenStyle.NoPen)
+        p.setBrush(QColor("#89b4fa"))
+        p.drawRoundedRect(4, 4, 56, 56, 12, 12)
+        p.setPen(QColor("#11111b"))
+        font = QFont("Segoe UI")
+        font.setPointSize(26)
+        font.setBold(True)
+        p.setFont(font)
+        p.drawText(pm.rect(), Qt.AlignmentFlag.AlignCenter, "P")
+        p.end()
+        return QIcon(pm)
+
+    def _show_window(self):
+        self.window.show()
+        self.window.activateWindow()
 
     def _toggle_ocr(self):
         """切换 OCR 识别开关"""
         self.ocr_enabled = not self.ocr_enabled
         status = "OCR 已开启" if self.ocr_enabled else "OCR 已关闭"
         self.window.show_toast(status)
+        self._tray_toggle_action.setText(
+            "关闭 OCR 识别" if self.ocr_enabled else "开启 OCR 识别")
 
-    def handle_image(self, img):
-        if not self.ocr_enabled:
+    def _on_clipboard_changed(self):
+        """剪贴板变化时检查是否为新图片，是则交给后台线程识别"""
+        if not self.ocr_enabled or self._ocr_busy:
             return
+        img = ImageGrab.grabclipboard()
+        if not isinstance(img, Image.Image):
+            return
+        # 像素数据 hash 去重，避免同一张图重复触发
+        img_hash = hash(img.tobytes())
+        if img_hash == self._last_clip_hash:
+            return
+        self._last_clip_hash = img_hash
 
-        # 直接传入 numpy 数组，省去 PNG 编解码开销
-        result, _ = engine(np.array(img))
-        if result:
-            ocr_text = format_ocr_layout(result)
-            self.window.update_and_show(ocr_text)
+        self._ocr_busy = True
+        worker = OcrWorker(img, self)
+        worker.done.connect(self._on_ocr_done)
+        worker.done.connect(worker.deleteLater)
+        worker.start()
+
+    def _on_ocr_done(self, ok, text):
+        self._ocr_busy = False
+        if not ok:
+            self.window.show_toast(f"OCR 失败: {text}", 2500)
+            return
+        if text:
+            self.window.update_and_show(text)
+        else:
+            self.window.show_toast("未识别到文字")
 
     def cleanup(self):
-        self.listener.stop()
-        self.listener.wait()
+        if self._hotkey_ok and sys.platform == "win32":
+            ctypes.windll.user32.UnregisterHotKey(
+                int(self.bridge.winId()), HOTKEY_ID)
 
 
 if __name__ == "__main__":
