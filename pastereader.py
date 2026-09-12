@@ -1,3 +1,4 @@
+import re
 import sys
 import ctypes
 
@@ -49,8 +50,123 @@ def _settings():
     return QSettings("PasteReader", "PasteReader")
 
 
+# ---------------------------------------------------------------------------
+# 翻译后端：多提供商自动回退。
+# 顺序：Google → MyMemory；每个后端先走系统代理，连接级失败（代理挂了、
+# 超时、被重置）后自动改为直连再试一次，然后才换下一个后端。
+# ---------------------------------------------------------------------------
+_UA = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) PasteReader/1.0"}
+
+# 这些错误值得“换个方式再试”（直连/换后端），而不是立刻放弃
+_CONN_ERRORS = (requests.exceptions.ProxyError,
+                requests.exceptions.ConnectionError,
+                requests.exceptions.SSLError,
+                requests.exceptions.Timeout)
+
+
+def _http_get(url, params, timeout=10, bypass_proxy=False):
+    if bypass_proxy:
+        s = requests.Session()
+        s.trust_env = False  # 忽略系统代理/环境变量，直连
+        return s.get(url, params=params, timeout=timeout, headers=_UA)
+    return requests.get(url, params=params, timeout=timeout, headers=_UA)
+
+
+def _retryable(e):
+    """判断这个错误是否值得换直连/换后端重试（429/5xx/网络类错误）"""
+    if isinstance(e, _CONN_ERRORS):
+        return True
+    if isinstance(e, requests.exceptions.HTTPError):
+        return (e.response is not None
+                and e.response.status_code in (403, 429, 500, 502, 503, 504))
+    return False
+
+
+def _translate_google(text, target, bypass):
+    r = _http_get(
+        "https://translate.googleapis.com/translate_a/single",
+        {"client": "gtx", "sl": "auto", "tl": target, "dt": "t", "q": text},
+        bypass_proxy=bypass)
+    r.raise_for_status()
+    data = r.json()
+    return "".join(item[0] for item in data[0] if item[0])
+
+
+def _guess_lang(text):
+    """按字符区间粗略判断源语言（MyMemory 不支持自动检测，需显式源语言）"""
+    sample = text[:2000]
+    n = max(len(sample), 1)
+
+    def ratio(lo, hi):
+        return sum(1 for ch in sample if lo <= ord(ch) <= hi) / n
+
+    if ratio(0x3040, 0x30FF) > 0.05:          # 日文假名
+        return "ja"
+    if ratio(0x0400, 0x04FF) > 0.3:           # 西里尔
+        return "ru"
+    if ratio(0x0600, 0x06FF) > 0.3:           # 阿拉伯
+        return "ar"
+    if ratio(0x0900, 0x097F) > 0.3:           # 天城
+        return "hi"
+    if ratio(0x0E00, 0x0E7F) > 0.3:           # 泰文
+        return "th"
+    if ratio(0xAC00, 0xD7AF) > 0.3:           # 谚文
+        return "ko"
+    if ratio(0x4E00, 0x9FFF) > 0.3:           # CJK 汉字（无假名 → 中文）
+        return "zh-CN"
+    return "en"
+
+
+def _chunk_text(text, limit=480):
+    """按句子边界分块；超长无标点片段硬切（MyMemory 单次最多 500 字符）"""
+    chunks, buf = [], ""
+    for part in re.split(r"(?<=[。！？!?.;\n])", text):
+        while len(part) > limit:
+            if buf:
+                chunks.append(buf)
+                buf = ""
+            chunks.append(part[:limit])
+            part = part[limit:]
+        if buf and len(buf) + len(part) > limit:
+            chunks.append(buf)
+            buf = part
+        else:
+            buf += part
+    if buf:
+        chunks.append(buf)
+    return chunks
+
+
+def _translate_mymemory(text, target, bypass):
+    src = _guess_lang(text)
+    if src == target:
+        return text  # 同语言，无需翻译
+    chunks = _chunk_text(text)
+
+    parts = []
+    for chunk in chunks:
+        r = _http_get(
+            "https://api.mymemory.translated.net/get",
+            {"q": chunk, "langpair": f"{src}|{target}"},
+            bypass_proxy=bypass)
+        r.raise_for_status()
+        data = r.json()
+        if data.get("responseStatus") != 200:
+            raise RuntimeError(
+                f"MyMemory {data.get('responseStatus')}: "
+                f"{data.get('responseDetails') or '未知错误'}")
+        parts.append(data["responseData"]["translatedText"])
+    return "".join(parts)
+
+
+_TRANSLATE_BACKENDS = (
+    ("Google", _translate_google),
+    ("MyMemory", _translate_mymemory),
+)
+
+
 class TranslateWorker(QThread):
-    """后台执行网络翻译，避免阻塞 UI 线程"""
+    """后台执行网络翻译，多提供商自动回退，避免阻塞 UI 线程"""
     done = pyqtSignal(bool, str)
 
     def __init__(self, text, target_lang, parent=None):
@@ -59,24 +175,32 @@ class TranslateWorker(QThread):
         self._target_lang = target_lang
 
     def run(self):
-        try:
-            response = requests.get(
-                "https://translate.googleapis.com/translate_a/single",
-                params={
-                    "client": "gtx",
-                    "sl": "auto",
-                    "tl": self._target_lang,
-                    "dt": "t",
-                    "q": self._text,
-                },
-                timeout=10,
-            )
-            response.raise_for_status()
-            data = response.json()
-            translated = "".join(item[0] for item in data[0] if item[0])
-            self.done.emit(True, translated)
-        except Exception as e:
-            self.done.emit(False, str(e))
+        errors = []
+        fallback_text = None  # 后端"原文回显"的兜底结果
+        for name, fn in _TRANSLATE_BACKENDS:
+            for bypass in (False, True):
+                try:
+                    result = (fn(self._text, self._target_lang, bypass)
+                              or "").strip()
+                    if not result:
+                        errors.append(f"{name}: 空结果")
+                        break
+                    if result == self._text.strip():
+                        # 原文回显：可能是 MyMemory 的已知毛病，也可能是
+                        # 原文本来就不需要翻译。先记为兜底，继续试其他后端。
+                        fallback_text = result
+                        break
+                    self.done.emit(True, result)
+                    return
+                except Exception as e:
+                    errors.append(
+                        f"{name}({'直连' if bypass else '代理'}): {str(e)[:80]}")
+                    if not _retryable(e):
+                        break  # 确定性失败（如 400/404），直接换下一个后端
+        if fallback_text is not None:
+            self.done.emit(True, fallback_text)
+        else:
+            self.done.emit(False, "；".join(errors) or "未知错误")
 
 
 class OcrWorker(QThread):
@@ -203,18 +327,23 @@ class HotkeyBridge(QWidget):
         self.winId()  # 强制创建原生窗口以接收系统消息
 
     def nativeEvent(self, eventType, message):
-        if eventType == "windows_generic_MSG":
+        # PyQt6 实际传入的是 bytes（b"windows_generic_MSG"），两种类型都兼容
+        if eventType in (b"windows_generic_MSG", "windows_generic_MSG"):
             try:
-                # Windows MSG 结构体：hwnd(指针大小) + message(4 字节)
+                # Windows MSG 结构体：hwnd(指针大小) + message(4 字节) + ...
+                base = int(message)
                 offset = ctypes.sizeof(ctypes.c_void_p)
                 msg_type = int.from_bytes(
-                    ctypes.string_at(message, offset), 2, "little")
+                    ctypes.string_at(base + offset, 4), "little")
                 if msg_type == WM_HOTKEY:
                     self.hotkey_pressed.emit()
                     return True, 0
             except Exception:
                 pass
-        return super().nativeEvent(eventType, message)
+        # 返回"未处理"让 Qt 走默认流程。
+        # 注意：不能调用 super().nativeEvent() —— 在 PyQt6 6.11 中它会
+        # 触发原生层崩溃（0xC0000409），而窗口创建期间系统消息就会进入这里
+        return False, 0
 
 
 class FloatingWindow(QWidget):
@@ -387,8 +516,20 @@ class FloatingWindow(QWidget):
         self._hide_timer.setSingleShot(True)
         self._hide_timer.timeout.connect(self.hide)
         self._lang_popup_open = False
-        self.lang_combo.showPopup.connect(self._on_lang_popup_show)
-        self.lang_combo.hidePopup.connect(self._on_lang_popup_hide)
+        # QComboBox 没有 popup 显隐信号，用事件过滤器监听其弹层（view）的 Show/Hide
+        self.lang_combo.view().installEventFilter(self)
+
+    def eventFilter(self, obj, event):
+        """监听语言下拉框弹层的显示/隐藏，避免打开期间误隐藏窗口"""
+        if obj is self.lang_combo.view():
+            if event.type() == QEvent.Type.Show:
+                self._lang_popup_open = True
+                self._hide_timer.stop()
+            elif event.type() == QEvent.Type.Hide:
+                self._lang_popup_open = False
+                if not self.isActiveWindow():
+                    self._hide_timer.start(200)
+        return super().eventFilter(obj, event)
 
     def changeEvent(self, event):
         """窗口失去焦点时延迟自动隐藏；语言下拉框打开期间不隐藏"""
@@ -398,17 +539,6 @@ class FloatingWindow(QWidget):
             elif not self._lang_popup_open:
                 self._hide_timer.start(200)
         super().changeEvent(event)
-
-    def _on_lang_popup_show(self):
-        """下拉框打开：暂停失焦隐藏"""
-        self._lang_popup_open = True
-        self._hide_timer.stop()
-
-    def _on_lang_popup_hide(self):
-        """下拉框关闭后若窗口仍未获得焦点，则走延迟隐藏流程"""
-        self._lang_popup_open = False
-        if not self.isActiveWindow():
-            self._hide_timer.start(200)
 
     def update_and_show(self, ocr_text, trans_text=""):
         """更新文本，定位到鼠标旁边并显示"""
@@ -466,7 +596,7 @@ class FloatingWindow(QWidget):
             self.trans_box.moveCursor(QTextCursor.MoveOperation.Start)
         else:
             self.trans_box.clear()
-            self.show_toast(f"翻译失败: {text}", 2500)
+            self.show_toast(f"翻译失败: {text[:100]}", 3000)
 
     def show_toast(self, message, duration=1500):
         """在屏幕中央底部显示短暂提示（非阻塞）"""
